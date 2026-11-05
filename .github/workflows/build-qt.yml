@@ -1,0 +1,127 @@
+name: Build Qt 5.15 for macOS (universal)
+
+# Builds the open-source (LGPL) Qt 5.15 LTS sources from download.qt.io for
+# macOS as universal binaries (arm64 + x86_64) together with a static
+# universal OpenSSL libcrypto, and publishes both as release assets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      qt_version:
+        description: Qt 5.15 version
+        default: "5.15.19"
+      openssl_version:
+        description: OpenSSL version
+        default: "3.0.18"
+
+permissions:
+  contents: write
+
+env:
+  QT_VERSION: ${{ inputs.qt_version || '5.15.19' }}
+  OPENSSL_VERSION: ${{ inputs.openssl_version || '3.0.18' }}
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+  QT_MODULES: >-
+    qtsvg qtimageformats qtdeclarative qtremoteobjects qtwebsockets
+    qtquickcontrols qtquickcontrols2 qtgraphicaleffects qtcharts qttools
+    qttranslations
+
+jobs:
+  openssl:
+    runs-on: macos-15
+    steps:
+      - name: Build OpenSSL (arm64 + x86_64, static)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o openssl.tar.gz "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+          for arch in arm64 x86_64; do
+            rm -rf src-$arch && mkdir src-$arch && tar -xzf openssl.tar.gz -C src-$arch --strip-components=1
+            target=darwin64-$arch-cc
+            (cd src-$arch && ./Configure $target no-shared no-tests --prefix="$PWD/../out-$arch" --libdir=lib \
+               -mmacosx-version-min=$MACOSX_DEPLOYMENT_TARGET && make -j"$(sysctl -n hw.ncpu)" && make install_sw)
+          done
+          P=openssl-${OPENSSL_VERSION}-macos-universal
+          mkdir -p $P/lib
+          cp -R out-arm64/include $P/
+          for lib in libcrypto.a libssl.a; do
+            lipo -create out-arm64/lib/$lib out-x86_64/lib/$lib -output $P/lib/$lib
+          done
+          lipo -info $P/lib/libcrypto.a
+          tar -cJf $P.tar.xz $P
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openssl
+          path: openssl-*.tar.xz
+
+  qt:
+    runs-on: macos-15
+    timeout-minutes: 360
+    steps:
+      - name: Download Qt sources
+        run: |
+          set -euo pipefail
+          BASE="https://download.qt.io/archive/qt/5.15/${QT_VERSION}/submodules"
+          mkdir src && cd src
+          for m in qtbase $QT_MODULES; do
+            f="$m-everywhere-opensource-src-${QT_VERSION}.tar.xz"
+            curl -fsSL -o "$f" "$BASE/$f"
+            curl -fsSL "$BASE/$f.sha256" -o "$f.sha256" && shasum -a 256 -c "$f.sha256" || echo "no sha256 for $f"
+            mkdir "$m" && tar -xJf "$f" -C "$m" --strip-components=1 && rm "$f"
+          done
+
+      - name: Configure and build qtbase
+        run: |
+          set -euo pipefail
+          PREFIX="$PWD/qt-${QT_VERSION}-macos-universal"
+          echo "PREFIX=$PREFIX" >> "$GITHUB_ENV"
+          cd src/qtbase
+          # AGL.framework is no longer part of the macOS SDK
+          grep -rl -- "-framework AGL" mkspecs | xargs sed -i '' 's/ -framework AGL//g' || true
+          ./configure -prefix "$PREFIX" -opensource -confirm-license -release \
+            -nomake examples -nomake tests -securetransport -no-openssl \
+            -device-option QMAKE_APPLE_DEVICE_ARCHS="x86_64 arm64" \
+            -device-option QMAKE_MACOSX_DEPLOYMENT_TARGET=$MACOSX_DEPLOYMENT_TARGET
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+
+      - name: Build modules
+        run: |
+          set -euo pipefail
+          export PATH="$PREFIX/bin:$PATH"
+          for m in $QT_MODULES; do
+            echo "::group::$m"
+            (cd "src/$m" && qmake && make -j"$(sysctl -n hw.ncpu)" && make install)
+            echo "::endgroup::"
+          done
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          # relocatable: qmake reads the prefix from bin/qt.conf
+          printf '[Paths]\nPrefix=..\n' > "$PREFIX/bin/qt.conf"
+          lipo -info "$PREFIX/lib/QtCore.framework/QtCore"
+          ls "$PREFIX/bin" | head -50
+          N=$(basename "$PREFIX")
+          tar -cJf "$N.tar.xz" -C "$(dirname "$PREFIX")" "$N"
+          ls -la "$N.tar.xz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qt
+          path: qt-*.tar.xz
+
+  release:
+    needs: [openssl, qt]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="qt-${QT_VERSION}-macos-universal"
+          gh release create "$TAG" *.tar.xz -R "$GITHUB_REPOSITORY" \
+            --title "Qt ${QT_VERSION} macOS universal + OpenSSL ${OPENSSL_VERSION}" \
+            --notes "Built from the open-source Qt ${QT_VERSION} sources (download.qt.io, LGPLv3/GPL) and OpenSSL ${OPENSSL_VERSION} (Apache 2.0). arm64 + x86_64, macOS ${MACOSX_DEPLOYMENT_TARGET}+." \
+          || gh release upload "$TAG" *.tar.xz --clobber -R "$GITHUB_REPOSITORY"
